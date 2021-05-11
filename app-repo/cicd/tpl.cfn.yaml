@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Simple API GW and Lambdas with the code inline
+
+Parameters:
+
+  Version:
+    Description: Naive versioning as a git ref
+    Type: String
+    Default: ${ENVSUBST_GITREF}
+
+  IsLive:
+    Description: Is this Stack referred by a live version CustomDomainName
+    Type: String
+
+  StageName:
+    Type: String
+    Default: live
+
+Resources:
+  # API
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  apiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - hwMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+      StageName: DummyDefaultUnusedStage
+
+  apiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref apiGatewayDeployment
+      MethodSettings:
+      - DataTraceEnabled: true
+        HttpMethod: "*"
+        LoggingLevel: INFO
+        ResourcePath: "/*"
+      RestApiId: !Ref apiGateway
+      StageName: !Ref StageName
+  # `hello world` method
+  hwMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaFunction1.Arn}/invocations'
+      ResourceId: !Ref hwResource
+      RestApiId: !Ref apiGateway
+
+  hwResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref apiGateway
+      ParentId: !GetAtt apiGateway.RootResourceId
+      PathPart: hw
+
+  # `call` method
+  callMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaFunction2.Arn}/invocations'
+      ResourceId: !Ref callResource
+      RestApiId: !Ref apiGateway
+
+  callResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref apiGateway
+      ParentId: !GetAtt apiGateway.RootResourceId
+      PathPart: call
+  
+  # Lambdas
+  lambdaFunction1:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          def handler(event,context):
+            return {
+              'body': f'hw v:{os.getenv("GIT_REF", "N/A")} {0}'.format(event['requestContext']['identity']['sourceIp']),
+              'headers': {
+                'Content-Type': 'text/plain'
+              },
+              'statusCode': 200
+            }
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt lambdaIAMRole.Arn
+      Runtime: python3.8
+      Environment:
+        Variables:
+          GIT_REF: !Ref Version
+
+  lambdaFunction2:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: src/target/lambda2.zip
+      Handler: lambda2.handler
+      MemorySize: 128
+      Role: !GetAtt lambdaIAMRole.Arn
+      Runtime: python3.8
+
+  lambdaApiGatewayInvoke2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt lambdaFunction2.Arn
+      Principal: apigateway.amazonaws.com
+      # note: if route *not* at API Gateway root, `SourceArn` would take the form of:
+      #               arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/${apiGatewayStageName}/${apiGatewayHTTPMethod}/PATH_PART
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/*/*/*
+
+  lambdaApiGatewayInvoke1:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt lambdaFunction1.Arn
+      Principal: apigateway.amazonaws.com
+      # note: if route *not* at API Gateway root, `SourceArn` would take the form of:
+      #               arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/${apiGatewayStageName}/${apiGatewayHTTPMethod}/PATH_PART
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/*/*/*
+
+  lambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - "*"
+          PolicyName: lambda
+
+  # # WAF rate-limit
+  # RateLimitACL:
+  #   Type: AWS::WAFv2::WebACL
+  #   Properties:
+  #     #Name: rate-limit-acl
+  #     Scope: REGIONAL
+  #     #Description: Auto-generated rate-limiting ACL.
+  #     DefaultAction:
+  #       Allow: {}
+  #     VisibilityConfig:
+  #       SampledRequestsEnabled: true
+  #       CloudWatchMetricsEnabled: true
+  #       MetricName: rate-limit-acl
+  #     Rules:
+  #       - Name: rate-limit-100requests-per-5minutes
+  #         Priority: 0
+  #         Action:
+  #           Block: {}
+  #         VisibilityConfig:
+  #           SampledRequestsEnabled: true
+  #           CloudWatchMetricsEnabled: true
+  #           MetricName: rate-limit
+  #         Statement:
+  #           RateBasedStatement:
+  #             AggregateKeyType: "IP"
+  #             Limit: 100
+
+  # WAFACLAssociation:
+  #   Type: AWS::WAFv2::WebACLAssociation
+  #   Properties:
+  #     ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/6glcqvbqf1/stages/live
+  #     WebACLArn: !GetAtt 'RateLimitACL.Arn'
+
+Outputs:
+  Version:
+    Value: !Ref Version
+
+  # Used by parent Stack to set up CustomDomainName and related stuff
+  StageName:
+    Value: !Ref StageName
+  RestApiId:
+    Value: !Ref apiGateway

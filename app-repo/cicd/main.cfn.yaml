@@ -1,0 +1,140 @@
+Parameters:
+
+  LiveStack: 
+    Description: Which slot is the current live one 
+    Type: String
+    # do not delete the comment on the next line !, it's used as a marker by grep in artifacts.sh
+    Default: A # LiveVersionMark
+    AllowedValues: [A, B]
+
+  HostedZoneId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /apigw-bluegreen/HostedZoneDomainId
+    Description: 'For Custom Domain Name'
+  HostedZoneDomainName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /apigw-bluegreen/HostedZoneDomainName
+    Description: 'For Custom Domain Name'
+  CertificateArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /apigw-bluegreen/CertificateArn
+    Description: 'For Custom Domain Name'
+
+  GreenDomainPrefix:
+    Type: String
+    Default: candidate
+
+Conditions:
+  IsALive: !Equals [ !Ref LiveStack, A ]
+  IsBLive: !Equals [ !Ref LiveStack, B ]
+  IsAGreen: !Equals [ !Ref LiveStack, B ]
+
+# Mappings:
+#   Route53Map:
+#     'AWS account ID':
+#       HostedZoneId: 123
+#       HostedZoneDomainName: example.com
+#     'AWS account ID':
+#       HostedZoneId: 456
+#       HostedZoneDomainName: sub.example.com
+#!Join [ '.' , [ !Sub '${MainStackName}-auth' , !FindInMap [ Route53Map, !Ref AWS::AccountId, HostedZoneDomainName ] ] ]
+
+Resources:
+
+  StackA:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: a.tpl.cfn.yaml
+      Parameters:
+        IsLive: !If [ IsALive, True, False ] 
+
+  StackB:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: b.tpl.cfn.yaml
+      Parameters:
+        IsLive: !If [ IsBLive, True, False ] 
+
+  # Live version DNS and related stuff
+  LiveBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    # https://stackoverflow.com/questions/43924140/invalid-domain-name-identifier-specified
+    Properties: 
+      RestApiId: !If [ IsALive, !GetAtt StackA.Outputs.RestApiId, !GetAtt StackB.Outputs.RestApiId ]
+      BasePath: !If [ IsALive, !GetAtt StackA.Outputs.StageName, !GetAtt StackB.Outputs.StageName ]
+      DomainName: !Ref LiveCustomDomainName
+      Stage: !If [ IsALive, !GetAtt StackA.Outputs.StageName, !GetAtt StackB.Outputs.StageName ]
+  LiveCustomDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      RegionalCertificateArn: !Ref CertificateArn
+      DomainName: !Sub '${AWS::StackName}.${HostedZoneDomainName}'
+      EndpointConfiguration:
+        Types: [REGIONAL]
+  LiveDNSRecord: 
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Region: !Sub '${AWS::Region}'
+      SetIdentifier: !Sub '${AWS::StackName}-${AWS::Region}'
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref LiveCustomDomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt LiveCustomDomainName.RegionalHostedZoneId
+        DNSName: !GetAtt LiveCustomDomainName.RegionalDomainName
+        EvaluateTargetHealth: false
+
+  # Green DNS and related
+  GreenBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    # https://stackoverflow.com/questions/43924140/invalid-domain-name-identifier-specified
+    Properties: 
+      RestApiId: !If [ IsAGreen, !GetAtt StackA.Outputs.RestApiId, !GetAtt StackB.Outputs.RestApiId] 
+      BasePath: !If [ IsAGreen, !GetAtt StackA.Outputs.StageName, !GetAtt StackB.Outputs.StageName] 
+      DomainName: !Ref GreenCustomDomainName
+      Stage: !If [ IsAGreen, !GetAtt StackA.Outputs.StageName, !GetAtt StackB.Outputs.StageName] 
+  GreenCustomDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      RegionalCertificateArn: !Ref CertificateArn
+      DomainName: !Sub '${GreenDomainPrefix}-${AWS::StackName}.${HostedZoneDomainName}'
+      EndpointConfiguration:
+        Types: [REGIONAL]
+  GreenDNSRecord: 
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Region: !Sub '${AWS::Region}'
+      SetIdentifier: !Sub '${AWS::StackName}-${AWS::Region}'
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref GreenCustomDomainName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt GreenCustomDomainName.RegionalHostedZoneId
+        DNSName: !GetAtt GreenCustomDomainName.RegionalDomainName
+        EvaluateTargetHealth: false
+
+Outputs:
+  LiveStackArn:
+    Value: !If [ IsALive, !Ref StackA, !Ref StackB]
+  CandidateStackArn:
+    Value: !If [ IsAGreen, !Ref StackA, !Ref StackB]
+  LiveStackWebConsoleLink:
+    Value: 
+      !Sub 
+        - 'https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/stackinfo?stackId=${Arn}&filteringStatus=active&filteringText=&viewNested=true&hideStacks=false'
+        - { Arn: !If [ IsALive, !Ref StackA, !Ref StackB] }
+  CandidateStackWebConsoleLink:
+    Value: 
+      !Sub 
+        - 'https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/stackinfo?stackId=${Arn}&filteringStatus=active&filteringText=&viewNested=true&hideStacks=false'
+        - { Arn: !If [ IsAGreen, !Ref StackA, !Ref StackB] }
+  LiveSlot:
+    Value: !Ref LiveStack
+  LiveVersion:
+    Value: !If [ IsALive, !GetAtt StackA.Outputs.Version, !GetAtt StackB.Outputs.Version]
+  GreenVersion:
+    Value: !If [ IsAGreen, !GetAtt StackA.Outputs.Version, !GetAtt StackB.Outputs.Version]
+  LiveApiUrl:
+    Value: !Ref LiveCustomDomainName
+  GreenApiUrl:
+    Value: !Ref GreenCustomDomainName
